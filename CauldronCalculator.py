@@ -10,6 +10,7 @@ import threading
 import time
 import itertools
 import gc
+import shutil
 
 LANGUAGES = {
     "zh_CN": {
@@ -79,7 +80,8 @@ LANGUAGES = {
         "exclude_duplicates": "忽略长度2序列的顺序颠倒",
         "render_settings": "渲染设置",
         "duplicate_hint": "仅对序列长度为2时有效（忽略颜色顺序颠倒）",
-        "duplicate_disabled_hint": "当前长度范围不包含2，此选项无效"
+        "duplicate_disabled_hint": "当前长度范围不包含2，此选项无效",
+        "invalid": "无效的操作：没有改变既有颜色。"
     },
     "zh_TW": {
         "title": "煉藥鍋顏色計算器",
@@ -148,7 +150,8 @@ LANGUAGES = {
         "exclude_duplicates": "忽略長度2序列的順序顛倒",
         "render_settings": "渲染設置",
         "duplicate_hint": "僅對序列長度為2時有效（忽略顏色順序顛倒）",
-        "duplicate_disabled_hint": "目前長度範圍不包含2，此選項無效"
+        "duplicate_disabled_hint": "目前長度範圍不包含2，此選項無效",
+        "invalid": "無效的操作：沒有改變既有顏色。"
     },
     "ja_JP": {
         "title": "大釜色計算機",
@@ -217,7 +220,8 @@ LANGUAGES = {
         "exclude_duplicates": "長さ2シーケンスの順序逆転を無視",
         "render_settings": "レンダリング設定",
         "duplicate_hint": "シーケンス長が2の場合のみ有効（色の順序逆転を無視）",
-        "duplicate_disabled_hint": "現在の長さ範囲に2が含まれていません、このオプションは無効です"
+        "duplicate_disabled_hint": "現在の長さ範囲に2が含まれていません、このオプションは無効です",
+        "invalid": "無効な操作：既存の色は変更されていません。"
     },
     "en_US": {
         "title": "Cauldron Color Calculator",
@@ -286,7 +290,8 @@ LANGUAGES = {
         "exclude_duplicates": "Ignore reversed order for length-2 sequences",
         "render_settings": "Render Settings",
         "duplicate_hint": "Only effective for sequences of length 2 (ignores color order reversal)",
-        "duplicate_disabled_hint": "Current length range does not include 2, this option is disabled"
+        "duplicate_disabled_hint": "Current length range does not include 2, this option is disabled",
+        "invalid": "Invalid operation: no existing colors were changed."
     }
 }
 
@@ -318,6 +323,7 @@ class ImageBlendApp:
         self.is_generating = False
         self.is_migrating = False
         self.is_batch_rendering = False
+        self.batch_cancelled = False
         self.status_timer = None
         
         self.color_data = [
@@ -1112,7 +1118,7 @@ class ImageBlendApp:
                 from_len = int(from_var.get())
                 to_len = int(to_var.get())
                 if from_len < 1 or to_len > 20 or from_len > to_len:
-                    messagebox.showwarning(self.lang["invalid_value"], "请确保范围在1-20之间，且起始<=结束")
+                    messagebox.showwarning(self.lang["invalid_value"])
                     return
                 
                 version = int(version_var.get())
@@ -1156,7 +1162,7 @@ class ImageBlendApp:
                 return f"Water_Cauldron_{be_str}"
             else:
                 return f"Water_Cauldron_({level_str})_{be_str}"
-            
+        
         if len(valid_seq) == 1:
             english_name = self.get_english_name(valid_seq[0])
             full_name = self.get_color_full_name(english_name)
@@ -1192,6 +1198,7 @@ class ImageBlendApp:
             return
         
         self.is_batch_rendering = True
+        self.batch_cancelled = False
         self.set_buttons_enabled(False)
         self.set_status(self.lang["rendering"])
         
@@ -1216,11 +1223,20 @@ class ImageBlendApp:
         if not os.path.exists(batch_output_dir):
             os.makedirs(batch_output_dir)
         
+        cache_dir = os.path.join(self.output_dir, ".cache", folder_name)
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+        
+        progress_file = os.path.join(cache_dir, "progress.txt")
+        enumerated_file = os.path.join(cache_dir, "enumerated.txt")
+        enumerate_progress_file = os.path.join(cache_dir, "enumerate_progress.txt")
+        render_progress_file = os.path.join(cache_dir, "render_progress.txt")
+        deduped_file = os.path.join(cache_dir, "deduped.txt")
+        
         progress_dialog = tk.Toplevel(self.root)
         progress_dialog.title(self.lang["rendering"])
-        progress_dialog.geometry("400x120")
+        progress_dialog.geometry("400x180")
         progress_dialog.transient(self.root)
-        progress_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
         
         progress_frame = ttk.Frame(progress_dialog, padding=15)
         progress_frame.pack(fill=tk.BOTH, expand=True)
@@ -1234,54 +1250,383 @@ class ImageBlendApp:
         status_label = ttk.Label(progress_frame, text="", font=("Arial", 8), foreground="gray")
         status_label.pack(pady=5)
         
+        def cancel_batch():
+            self.batch_cancelled = True
+            self.set_status("正在取消...", auto_reset=True)
+        
+        cancel_btn = ttk.Button(progress_frame, text=self.lang["cancel"], command=cancel_batch, width=15)
+        cancel_btn.pack(pady=5)
+        
         def update_progress(current, total, seq_info=""):
             try:
                 progress_label.config(text=self.lang["render_progress"].format(current, total))
-                progress_bar.config(value=(current / total) * 100)
+                progress_bar.config(value=(current / total) * 100 if total > 0 else 0)
                 status_label.config(text=seq_info)
                 progress_dialog.update()
             except:
                 pass
         
+        def read_progress_state():
+            if os.path.exists(progress_file):
+                try:
+                    with open(progress_file, 'r', encoding='utf-8') as f:
+                        data = {}
+                        for line in f:
+                            if '=' in line:
+                                key, val = line.strip().split('=', 1)
+                                data[key] = val
+                        state = data.get('state', '')
+                        total = int(data.get('total', 0))
+                        current_index = int(data.get('current_index', 0))
+                        return state, total, current_index
+                except:
+                    pass
+            return '', 0, 0
+        
+        def write_progress_state(state, total, current_index):
+            try:
+                with open(progress_file, 'w', encoding='utf-8') as f:
+                    f.write(f"state={state}\n")
+                    f.write(f"total={total}\n")
+                    f.write(f"current_index={current_index}\n")
+            except:
+                pass
+        
+        def append_enumerated_sequence(seq):
+            try:
+                with open(enumerated_file, 'a', encoding='utf-8') as f:
+                    f.write(','.join(seq) + '\n')
+            except:
+                pass
+        
+        def load_enumerated_sequences():
+            if os.path.exists(enumerated_file):
+                try:
+                    sequences = []
+                    with open(enumerated_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                parts = line.split(',')
+                                seq = [p for p in parts if p]
+                                sequences.append(seq)
+                    return sequences
+                except:
+                    pass
+            return []
+        
+        def save_deduped_sequences(sequences):
+            try:
+                with open(deduped_file, 'w', encoding='utf-8') as f:
+                    for seq in sequences:
+                        f.write(','.join(seq) + '\n')
+            except:
+                pass
+        
+        def load_deduped_sequences():
+            if os.path.exists(deduped_file):
+                try:
+                    sequences = []
+                    with open(deduped_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                parts = line.split(',')
+                                seq = [p for p in parts if p]
+                                sequences.append(seq)
+                    return sequences
+                except:
+                    pass
+            return []
+        
+        def load_enumerate_progress():
+            if os.path.exists(enumerate_progress_file):
+                try:
+                    with open(enumerate_progress_file, 'r', encoding='utf-8') as f:
+                        line = f.read().strip()
+                        if line:
+                            return line.split(',')
+                except:
+                    pass
+            return None
+        
+        def save_enumerate_progress(seq):
+            try:
+                with open(enumerate_progress_file, 'w', encoding='utf-8') as f:
+                    if seq:
+                        f.write(','.join(seq))
+                    else:
+                        f.write('')
+            except:
+                pass
+        
+        def load_render_progress():
+            if os.path.exists(render_progress_file):
+                try:
+                    sequences = []
+                    with open(render_progress_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                parts = line.split(',')
+                                seq = [p for p in parts if p]
+                                sequences.append(seq)
+                    return sequences
+                except:
+                    pass
+            return []
+        
+        def save_render_progress(seq):
+            try:
+                with open(render_progress_file, 'a', encoding='utf-8') as f:
+                    f.write(','.join(seq) + '\n')
+            except:
+                pass
+        
+        def clear_cache():
+            try:
+                for f in [progress_file, enumerated_file, enumerate_progress_file, render_progress_file, deduped_file]:
+                    if os.path.exists(f):
+                        os.remove(f)
+                if os.path.exists(cache_dir) and not os.listdir(cache_dir):
+                    os.rmdir(cache_dir)
+            except:
+                pass
+        
+        def generate_sequences_with_progress(available_colors, from_len, to_len, start_length, start_seq):
+            started = False if start_seq is not None else True
+            
+            for length in range(from_len, to_len + 1):
+                if length < start_length:
+                    continue
+                elif length == start_length and start_seq is not None:
+                    found_start = False
+                    for seq in itertools.product(available_colors, repeat=length):
+                        if not found_start:
+                            if list(seq) == start_seq:
+                                found_start = True
+                                yield list(seq), length
+                        else:
+                            yield list(seq), length
+                else:
+                    for seq in itertools.product(available_colors, repeat=length):
+                        yield list(seq), length
+        
         def render_worker():
             try:
                 available_colors = [h for h, _, _ in self.color_data]
+                
+                state, total, current_index = read_progress_state()
+                
+                deduped_sequences = load_deduped_sequences()
+                
+                if deduped_sequences:
+                    state = 'rendering'
+                    all_sequences = deduped_sequences
+                else:
+                    all_sequences = load_enumerated_sequences()
+                
+                enumerate_progress = load_enumerate_progress()
+                rendered_sequences = load_render_progress()
                 
                 old_version = self.current_version
                 old_level = self.current_image_index
                 old_sequence = self.color_sequence.copy()
                 old_times = self.color_times.copy()
                 
-                all_sequences = []
-                
-                for length in range(from_len, to_len + 1):
-                    for seq in itertools.product(available_colors, repeat=length):
-                        seq_list = list(seq)
-                        
-                        self.color_sequence.clear()
-                        for key in self.color_times:
-                            self.color_times[key] = 0
-                        
-                        all_valid = True
-                        for color in seq_list:
-                            if not self.add_color_to_sequence(color):
-                                all_valid = False
+                if state == 'rendering' and all_sequences:
+                    self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']}"))
+                    
+                    start_idx = 0
+                    if rendered_sequences:
+                        last_rendered = rendered_sequences[-1]
+                        for idx, seq in enumerate(all_sequences):
+                            if seq == last_rendered:
+                                start_idx = idx
                                 break
+                        if start_idx > 0:
+                            rendered_sequences = rendered_sequences[:-1]
+                            with open(render_progress_file, 'w', encoding='utf-8') as f:
+                                for seq in rendered_sequences:
+                                    f.write(','.join(seq) + '\n')
+                    
+                    total = len(all_sequences)
+                    self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']} ({start_idx+1}/{total})"))
+                    
+                    for idx in range(start_idx, total):
+                        if self.batch_cancelled:
+                            break
                         
-                        if all_valid and len(self.color_sequence) == len(seq_list):
-                            final_seq = self.color_sequence.copy()
-                            if length == 2 and len(final_seq) == 2:
-                                final_seq = self.sort_two_color_sequence(final_seq)
-                            all_sequences.append(final_seq)
+                        seq = all_sequences[idx]
+                        seq_names = [self.get_english_name(c) for c in seq]
+                        seq_display = ", ".join(seq_names[:3])
+                        if len(seq_names) > 3:
+                            seq_display += f"... (+{len(seq_names)-3})"
+                        
+                        if idx % 5 == 0 or idx == total - 1:
+                            self.root.after(0, lambda i=idx, t=total, s=seq_display: update_progress(i+1, t, s))
+                            self.root.after(0, lambda i=idx, t=total: self.set_status(f"{self.lang['rendering']} ({i+1}/{t})"))
+                            write_progress_state('rendering', total, idx)
+                        
+                        try:
+                            self.color_sequence.clear()
+                            for key in self.color_times:
+                                self.color_times[key] = 0
+                            
+                            for color in seq:
+                                self.add_color_to_sequence(color)
+                            
+                            self.update_sequence_display()
+                            self.update_times_display()
+                            self.update_display()
+                            
+                            final_img = self.render_single_image()
+                            
+                            filename = self.generate_filename_for_sequence(seq) + ".png"
+                            file_path = os.path.join(batch_output_dir, filename)
+                            final_img.save(file_path, 'PNG')
+                            
+                            del final_img
+                            
+                            save_render_progress(seq)
+                            
+                        except Exception as e:
+                            print(f"渲染序列 {seq} 失败: {e}")
+                        
+                        if (idx + 1) % 5 == 0:
+                            try:
+                                progress_dialog.update()
+                            except:
+                                pass
+                            gc.collect()
+                            time.sleep(0.05)
+                        
+                        time.sleep(0.01)
+                    
+                    if not self.batch_cancelled:
+                        clear_cache()
+                        self.root.after(0, lambda: self.set_status(self.lang["render_complete"].format(total), auto_reset=True))
+                        self.root.after(0, lambda: messagebox.showinfo(self.lang["tip"], self.lang["render_complete"].format(total)))
+                    
+                    self.current_version = old_version
+                    self.current_image_index = old_level
+                    self.color_sequence = old_sequence
+                    self.color_times = old_times
+                    
+                    self.load_background()
+                    self.load_dye_images()
+                    self.load_images()
+                    self.update_sequence_display()
+                    self.update_times_display()
+                    self.update_display()
+                    
+                    try:
+                        progress_dialog.destroy()
+                    except:
+                        pass
+                    self.is_batch_rendering = False
+                    self.set_buttons_enabled(True)
+                    return
+
+                self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']}"))
                 
-                self.color_sequence = old_sequence
-                self.color_times = old_times
+                start_length = from_len
+                start_seq = None
+                
+                if enumerate_progress:
+                    start_seq = enumerate_progress
+                    start_length = len(start_seq)
+                    self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']}"))
+                
+                enumerate_count = 0
+                if all_sequences:
+                    enumerate_count = len(all_sequences)
+                    self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']}"))
+                
+                seq_generator = generate_sequences_with_progress(
+                    available_colors, from_len, to_len, start_length, start_seq
+                )
+                
+                for seq, length in seq_generator:
+                    if self.batch_cancelled:
+                        break
+                    
+                    enumerate_count += 1
+                    
+                    if enumerate_count % 10 == 0:
+                        save_enumerate_progress(seq)
+                        if enumerate_count % 100 == 0:
+                            self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']}"))
+                    
+                    self.color_sequence.clear()
+                    for key in self.color_times:
+                        self.color_times[key] = 0
+                    
+                    all_valid = True
+                    for color in seq:
+                        if not self.add_color_to_sequence(color):
+                            all_valid = False
+                            break
+                    
+                    if all_valid and len(self.color_sequence) == len(seq):
+                        final_seq = self.color_sequence.copy()
+                        if len(final_seq) == 2:
+                            final_seq = self.sort_two_color_sequence(final_seq)
+                        append_enumerated_sequence(final_seq)
+                
+                if self.batch_cancelled:
+                    self.current_version = old_version
+                    self.current_image_index = old_level
+                    self.color_sequence = old_sequence
+                    self.color_times = old_times
+                    
+                    self.load_background()
+                    self.load_dye_images()
+                    self.load_images()
+                    self.update_sequence_display()
+                    self.update_times_display()
+                    self.update_display()
+                    
+                    try:
+                        progress_dialog.destroy()
+                    except:
+                        pass
+                    self.is_batch_rendering = False
+                    self.set_buttons_enabled(True)
+                    return
+                
+                all_enumerated = load_enumerated_sequences()
+                
+                if not all_enumerated:
+                    self.root.after(0, lambda: self.set_status(self.lang["error"], auto_reset=True))
+                    messagebox.showinfo(self.lang["tip"])
+                    
+                    self.current_version = old_version
+                    self.current_image_index = old_level
+                    self.color_sequence = old_sequence
+                    self.color_times = old_times
+                    
+                    self.load_background()
+                    self.load_dye_images()
+                    self.load_images()
+                    self.update_sequence_display()
+                    self.update_times_display()
+                    self.update_display()
+                    
+                    try:
+                        progress_dialog.destroy()
+                    except:
+                        pass
+                    self.is_batch_rendering = False
+                    self.set_buttons_enabled(True)
+                    return
                 
                 if exclude_duplicates:
+                    self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']}"))
                     filtered_sequences = []
                     seen_signatures = set()
                     
-                    for seq in all_sequences:
+                    for seq in all_enumerated:
                         if len(seq) == 2:
                             sig = tuple(sorted(seq))
                         else:
@@ -1292,22 +1637,41 @@ class ImageBlendApp:
                             filtered_sequences.append(seq)
                     
                     all_sequences = filtered_sequences
+                else:
+                    all_sequences = all_enumerated
                 
-                total = len(all_sequences)
-                if total == 0:
-                    self.root.after(0, lambda: self.set_status(self.lang["error"].format("没有序列需要渲染"), auto_reset=True))
+                save_deduped_sequences(all_sequences)
+                write_progress_state('rendering', len(all_sequences), 0)
+                
+                if not all_sequences:
+                    self.root.after(0, lambda: self.set_status(self.lang["error"], auto_reset=True))
+                    messagebox.showinfo(self.lang["tip"])
+                    
+                    self.current_version = old_version
+                    self.current_image_index = old_level
+                    self.color_sequence = old_sequence
+                    self.color_times = old_times
+                    
+                    self.load_background()
+                    self.load_dye_images()
+                    self.load_images()
+                    self.update_sequence_display()
+                    self.update_times_display()
+                    self.update_display()
+                    
+                    try:
+                        progress_dialog.destroy()
+                    except:
+                        pass
                     self.is_batch_rendering = False
                     self.set_buttons_enabled(True)
-                    progress_dialog.destroy()
                     return
                 
-                self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']} (0/{total})"))
+                self.root.after(0, lambda: self.set_status(f"{self.lang['rendering']}"))
                 
-                batch_size = 5
-                update_interval = 10
-                
+                total = len(all_sequences)
                 for idx, seq in enumerate(all_sequences):
-                    if not self.is_batch_rendering:
+                    if self.batch_cancelled:
                         break
                     
                     seq_names = [self.get_english_name(c) for c in seq]
@@ -1315,9 +1679,10 @@ class ImageBlendApp:
                     if len(seq_names) > 3:
                         seq_display += f"... (+{len(seq_names)-3})"
                     
-                    if idx % update_interval == 0 or idx == total - 1:
+                    if idx % 5 == 0 or idx == total - 1:
                         self.root.after(0, lambda i=idx, t=total, s=seq_display: update_progress(i+1, t, s))
                         self.root.after(0, lambda i=idx, t=total: self.set_status(f"{self.lang['rendering']} ({i+1}/{t})"))
+                        write_progress_state('rendering', total, idx)
                     
                     try:
                         self.color_sequence.clear()
@@ -1339,10 +1704,12 @@ class ImageBlendApp:
                         
                         del final_img
                         
+                        save_render_progress(seq)
+                        
                     except Exception as e:
-                        print(f"渲染序列 {seq} 失败: {e}")
+                        print("")
                     
-                    if (idx + 1) % batch_size == 0:
+                    if (idx + 1) % 5 == 0:
                         try:
                             progress_dialog.update()
                         except:
@@ -1352,18 +1719,29 @@ class ImageBlendApp:
                     
                     time.sleep(0.01)
                 
+                if not self.batch_cancelled:
+                    clear_cache()
+                    self.root.after(0, lambda: self.set_status(self.lang["render_complete"].format(total), auto_reset=True))
+                    self.root.after(0, lambda: messagebox.showinfo(self.lang["tip"], self.lang["render_complete"].format(total)))
+                
+                self.current_version = old_version
+                self.current_image_index = old_level
                 self.color_sequence = old_sequence
                 self.color_times = old_times
                 
+                self.load_background()
+                self.load_dye_images()
+                self.load_images()
                 self.update_sequence_display()
                 self.update_times_display()
                 self.update_display()
                 
-                progress_dialog.destroy()
+                try:
+                    progress_dialog.destroy()
+                except:
+                    pass
                 self.is_batch_rendering = False
                 self.set_buttons_enabled(True)
-                self.root.after(0, lambda: self.set_status(self.lang["render_complete"].format(total), auto_reset=True))
-                self.root.after(0, lambda: messagebox.showinfo(self.lang["tip"], self.lang["render_complete"].format(total)))
                 
             except Exception as e:
                 try:
@@ -1994,7 +2372,7 @@ class ImageBlendApp:
                 self.reload_images()
         else:
             display_name = self.get_display_color_name(english_name) if english_name else hex_val
-            self.set_status(f"无效加入：{display_name} 没有改变颜色", auto_reset=True)
+            self.set_status(self.lang["invalid"], auto_reset=True)
         
         return changed
     
@@ -2110,7 +2488,7 @@ class ImageBlendApp:
             result = Image.alpha_composite(bg, fg_img)
             return result
         except Exception as e:
-            print(f"合成错误: {e}")
+            print("")
             return self.background_image.copy()
     
     def update_display(self):
